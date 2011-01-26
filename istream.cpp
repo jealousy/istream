@@ -42,17 +42,39 @@ float numPiecesToBuffer(torrent_info ti, int mode, int timeToBuffer) {
 }
 
 
-void setPriority(torrent_handle th, int numPieces, int numBuffer) {
-  int i, priority;
-  i = 0;
-  for (priority = 7; priority >= 1; priority--) {
-    for (; i < numBuffer; i++) {
-      th.piece_priority(i, priority);
-    }
-    i++;
-    numBuffer += numBuffer;
-  }
+void setPriority(torrent_handle th, int numPieces, int numBuffer, int blockNum) {
+
+//  int i, priority;
+//  i = 0;
+//  for (priority = 7; priority >= 1; priority--) {
+//    for (; i < numBuffer; i++) {
+//      th.piece_priority(i, priority);
+//    }
+//    i++;
+//    numBuffer += numBuffer;
+//  }
+
+  int start = blockNum * numBuffer;
+
+  for (int i = start; i < (start + numBuffer); i++) 
+    th.piece_priority(i, 7);
+
+  for (int i = start + numBuffer; i < numPieces; i++)
+    th.piece_priority(i, 0);
 }
+
+float compScore(torrent_handle th, int blockNum, int size) {
+  torrent_status ts = th.status();
+
+  float score = 0.0;
+  int start = blockNum * size;
+  for (int i = start; i < start + size; i++)
+    score += ts.pieces[i];
+
+  cout << "The score is: " << score / size << endl;
+  return score / size;
+}
+
 
 //void fillGaps(torrent_handle th, torrent_status ts, session s)  {
 //  for (int i = 10; i < ts.pieces.size(); i++) {
@@ -103,6 +125,11 @@ int main(int argc, char* argv[]) {
 	error_code ec;
 	p.ti = new torrent_info(argv[1], ec);
 
+  session_settings ss;
+  ss.disable_hash_checks = true;
+
+  s.set_settings(ss);
+
 	if (ec) {
 		std::cout << ec.message() << std::endl;
 		return 1;
@@ -115,9 +142,9 @@ int main(int argc, char* argv[]) {
 	torrent_handle th = s.add_torrent(p, ec);
 
   //sets sequential download
-//  th.set_sequential_download(true);
+  th.set_sequential_download(true);
 
-  th.set_max_connections(40);
+  th.set_max_connections(100);
 
 	if (ec) {
 		std::cerr << ec.message() << std::endl;
@@ -140,9 +167,14 @@ int main(int argc, char* argv[]) {
 
   cout << "Buffering: " << numBuffer << " pieces" << endl;
 
-  setPriority(th, numPieces, numBuffer);
+  numBuffer = 100;
 
 //  printPriority(th);
+
+  int blockNum = 0;
+
+  int numWait = 0;
+  setPriority(th, numPieces, numBuffer, blockNum);
 
   while(1) {
     if (t.elapsed() > 5) {
@@ -152,33 +184,77 @@ int main(int argc, char* argv[]) {
       num_seeds = ts.num_seeds;
       bitfield pieces = ts.pieces;
 
-      int dlpiece = -1;
 
+      if (compScore(th, blockNum, numBuffer) > 0.5 && download_rate < 30) {
+        if (numWait++ > 4) {;
+          cout << "### Resetting connections ### " << endl;
+          th.pause();
+          th.resume();
+          numWait = 0;
+        }
+      }
 
-      if (dlpiece == -1) {
-        for(int i = 0; i < 15; i++) {
-          if (ts.pieces[i]) {
-            dlpiece = i;
-            break;
+      if (compScore(th, blockNum, numBuffer) == 1.0 && blockNum == 0)
+        setPriority(th, numPieces, numBuffer, ++blockNum);
+      else if (blockNum != 0 && compScore(th, blockNum, numBuffer)  > 0.8 ) {
+        cout << "###### CHANGING BLOCK #####" << endl;
+        for (int i = 50; i < pieces.size(); i++) {
+          bool comp = true;
+          if (!ts.pieces[i]) {
+            for (int j = (i- 1); j > (i - 5); j--) 
+              if (!ts.pieces[j]) comp = false;
+            for (int j = (i+1); j < (i + 5); j++) 
+              if (!ts.pieces[j]) comp = false;
+            if (comp) {
+              cout << "Calling READ: " << endl;
+              th.read_piece(i - 1);
+              time_duration td = seconds(5);
+              bool foundPiece = false;
+              while (!foundPiece) {
+                const alert * a = s.wait_for_alert(td);
+                std::auto_ptr<alert> holder = s.pop_alert();
+                if (alert_cast<read_piece_alert>(a)) {
+                  const read_piece_alert* rpa = alert_cast<read_piece_alert>(a);
+                  if (rpa->piece == (i - 1)) {
+                    foundPiece = true;
+                    cout << "Piece found: " << rpa->piece;
+                    char const* data = rpa->buffer.get();
+                    th.add_piece(i, data, 1);
+                  }
+                }
+              }
+            }
           }
         }
+        setPriority(th, numPieces, numBuffer, ++blockNum);
       }
-
-      if (dlpiece != -1) {
-        cout << "CALLED READ" << endl;
-        bool found = false;
-
-        time_duration td = seconds(5);
-
-        th.read_piece(dlpiece);
-
-        const alert * a = s.wait_for_alert(td);
-        std::auto_ptr<alert> holder = s.pop_alert();
-        if (alert_cast<read_piece_alert>(a)) {
-          const read_piece_alert* rpa = alert_cast<read_piece_alert>(a);
-          cout << "Piece found: " << rpa->piece;
-        }
-      }
+//      int dlpiece = -1;
+//
+//
+//      if (dlpiece == -1) {
+//        for(int i = 0; i < 15; i++) {
+//          if (ts.pieces[i]) {
+//            dlpiece = i;
+//            break;
+//          }
+//        }
+//      }
+//
+//      if (dlpiece != -1) {
+//        cout << "CALLED READ" << endl;
+//        bool found = false;
+//
+//        time_duration td = seconds(5);
+//
+//        th.read_piece(dlpiece);
+//
+//        const alert * a = s.wait_for_alert(td);
+//        std::auto_ptr<alert> holder = s.pop_alert();
+//        if (alert_cast<read_piece_alert>(a)) {
+//          const read_piece_alert* rpa = alert_cast<read_piece_alert>(a);
+//          cout << "Piece found: " << rpa->piece;
+//        }
+//      }
 
 
       for (int i = 0; i < ts.pieces.size(); i++)
@@ -187,22 +263,30 @@ int main(int argc, char* argv[]) {
 
 //      fillGaps(th, ts, s);
 
-//        for (int i = 10; i < pieces.size(); i++) {
+//        for (int i = 50; i < pieces.size(); i++) {
 //          bool comp = true;
 //          if (!ts.pieces[i]) {
 //            for (int j = (i- 1); j > (i - 5); j--) 
+//              if (!ts.pieces[j]) comp = false;
+//            for (int j = (i+1); j < (i + 5); j++) 
 //              if (!ts.pieces[j]) comp = false;
 //            if (comp) {
 //              cout << "Calling READ: " << endl;
 //              th.read_piece(i - 1);
 //              time_duration td = seconds(5);
-//              bool findAlert = false;
-//              while (!findAlert) {
+//              bool foundPiece = false;
+//              while (!foundPiece) {
 //                const alert * a = s.wait_for_alert(td);
 //                std::auto_ptr<alert> holder = s.pop_alert();
-//                if (strcmp(a->what(), "read_piece_alert"))
-//                  findAlert = true;
-//              cout << a->what() << endl;
+//                if (alert_cast<read_piece_alert>(a)) {
+//                  const read_piece_alert* rpa = alert_cast<read_piece_alert>(a);
+//                  if (rpa->piece == (i - 1)) {
+//                    foundPiece = true;
+//                    cout << "Piece found: " << rpa->piece;
+//                    char const* data = rpa->buffer.get();
+//                    th.add_piece(i, data, 1);
+//                  }
+//                }
 //              }
 //            }
 //          }
